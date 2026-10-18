@@ -1,0 +1,15 @@
+[[media]]
+file = "cascade.json.gz"
+name = "The victory cascade burying the table"
+
+[[media]]
+file = "play.json.gz"
+name = "A run moving between columns"
+
+[[media]]
+file = "won.png"
+name = "The painted table after a win"
+
+[[media]]
+file = "title.png"
+name = "The title screen"

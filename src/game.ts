@@ -1,41 +1,9 @@
-// Cascade — the game. THIS IS THE FILE YOU IMPLEMENT.
+// Cascade — the game.
 //
-// `src/main.ts`, `src/constants.ts` and the project's configuration are supplied
-// with the project and stay as they are. What is missing is the game: the state it
-// holds, the debug surface that poses and reads that state, and the three
-// functions below.
-//
-// FIRST, DECLARE AND EXPORT `CascadeState`, exactly as `specs/state.md` fixes it,
-// and `CascadeDebugApi`, the debug and automation surface
-// `specs/instrumentation.md` specifies. The stub below is written against both
-// names, so this project does not compile until they exist — the type check
-// failing on a freshly seeded workspace is the starting point, not a broken seed.
-//
-// THEN IMPLEMENT the three functions. `initialize` runs once, when the engine is
-// initialized, and returns the state and the debug surface together, as the pair
-// `[state, debug]`. `update` and `render` then run once each per frame — `update`
-// first, with the frame's delta time in SECONDS, then `render`.
-//
-// The state is a VALUE, and every frame is a transition over it. The engine hands
-// `update` the current state as a read-only view (`DeepReadonly<CascadeState>`)
-// and stores whatever `update` returns as the next state; `render` is handed that
-// next state, as the same read-only view, and returns nothing. Nothing ever holds
-// a writable `CascadeState`: `update` builds the next state from the current one
-// (spread the parts that change, `map` over the arrays) rather than assigning into
-// it, and a frame that returns `undefined` is refused by the engine. The engine's
-// own documentation, seeded at `engine/`, defines all of this and the scoped APIs
-// each function receives; read it before you start.
-//
-// The engine returns the surface from `engine.debug`, exactly as `initialize`
-// handed it over, which is how the game is driven from code
-// (`specs/instrumentation.md`). Because no one holds a writable state, the surface
-// is written in the shape of `update`: a pose takes the current state and returns
-// the next (`addCard(state, ...)`), a reading takes the state and returns what it
-// read (`snapshot(state)`), and a caller drives them through `engine.apply` and
-// `engine.state`. `move` and `autoMove` are neither: each applies the game's own
-// rules and then reports what those rules decided, so each returns the pair
-// `[nextState, boolean]`. Where the implementation lives under `src/` is your
-// call; the only fixed point is that `initialize` returns the surface.
+// This module declares the state the game is written against (specs/state.md)
+// and the debug and automation surface (specs/instrumentation.md), and binds the
+// three functions the engine drives. The rules, the pointer, the cascade, and the
+// drawing live in their own modules beside this one.
 
 import type {
   Game,
@@ -44,66 +12,328 @@ import type {
   UpdateApi,
 } from "@clockwyrks/simple-2d";
 import type { DeepReadonly } from "ts-essentials";
+import { CUE_SPECS } from "./audio";
+import { stepCascade } from "./cascade";
+import {
+  type CueName,
+  MENU_BACK,
+  MENU_BINDINGS,
+  MENU_CONFIRM,
+  MENU_DOWN,
+  MENU_UP,
+} from "./constants";
+import { createDebugApi, initialState } from "./debug";
+import { registerDiagnostics } from "./diagnostics";
+import { applyMenuKeys } from "./menus";
+import { createPaintLayer } from "./paint";
+import { pointerDown, pointerMove, pointerUp } from "./pointer";
+import { renderState } from "./render";
+import { prepareSprites } from "./sprites";
+import type { GameState, Step, View } from "./types";
+
+// ---- The state (specs/state.md) -------------------------------------------
+
+export type Screen = "title" | "howto" | "playing" | "won";
+
+export type Suit = "spades" | "hearts" | "diamonds" | "clubs";
+
+export type PileKind = "stock" | "waste" | "foundation" | "tableau";
+
+export interface CardState {
+  readonly id: number;
+  readonly suit: Suit;
+  readonly rank: number;
+  readonly faceUp: boolean;
+}
+
+export interface DragState {
+  readonly cards: readonly CardState[];
+  readonly fromPile: "waste" | "foundation" | "tableau";
+  readonly fromIndex: number;
+  readonly x: number;
+  readonly y: number;
+}
+
+export interface DropTargetState {
+  readonly pile: "foundation" | "tableau";
+  readonly index: number;
+}
+
+export interface PointerState {
+  readonly x: number;
+  readonly y: number;
+  readonly down: boolean;
+}
+
+export interface PressState {
+  readonly x: number;
+  readonly y: number;
+  readonly at: number;
+}
+
+export interface FlyerState {
+  readonly id: number;
+  readonly suit: Suit;
+  readonly rank: number;
+  readonly x: number;
+  readonly y: number;
+  readonly vx: number;
+  readonly vy: number;
+}
+
+export interface CascadeState {
+  readonly screen: Screen;
+  readonly menuIndex: number;
+  readonly titleIndex: number;
+
+  readonly stock: readonly CardState[];
+  readonly waste: readonly CardState[];
+  readonly wasteSets: readonly number[];
+  readonly foundations: readonly (readonly CardState[])[];
+  readonly tableau: readonly (readonly CardState[])[];
+
+  readonly drag: DragState | null;
+  readonly dropTarget: DropTargetState | null;
+  readonly pointer: PointerState;
+  readonly lastPress: PressState | null;
+
+  readonly autoFlip: boolean;
+  readonly winDetect: boolean;
+  readonly launching: boolean;
+  readonly trailPainting: boolean;
+
+  readonly launchClock: number;
+  readonly launched: number;
+  readonly flyers: readonly FlyerState[];
+  readonly cascadeDone: boolean;
+  readonly trailStamps: number;
+
+  readonly nextId: number;
+  readonly simTime: number;
+  readonly muted: boolean;
+}
+
+// ---- The debug surface (specs/instrumentation.md) --------------------------
+
+/** A card as the snapshot reports it, its color read from its suit. */
+export interface CardSnapshot {
+  id: number;
+  suit: Suit;
+  rank: number;
+  color: "red" | "black";
+  faceUp: boolean;
+}
+
+/** What `snapshot` returns: the state as plain values. */
+export interface CascadeSnapshot {
+  version: number;
+  screen: Screen;
+  menuIndex: number;
+  titleIndex: number;
+  dealMode: string;
+  turnCount: number;
+  dealModeLabel: string;
+  muted: boolean;
+
+  autoFlip: boolean;
+  winDetect: boolean;
+  launching: boolean;
+  trailPainting: boolean;
+
+  stock: CardSnapshot[];
+  waste: CardSnapshot[];
+  wasteSets: number[];
+  wasteVisibleCount: number;
+  foundations: CardSnapshot[][];
+  tableau: CardSnapshot[][];
+
+  drag: null | {
+    cards: CardSnapshot[];
+    fromPile: "waste" | "foundation" | "tableau";
+    fromIndex: number;
+    x: number;
+    y: number;
+  };
+  dropTarget: null | { pile: "foundation" | "tableau"; index: number };
+
+  pointer: { x: number; y: number; down: boolean };
+  lastPress: null | { x: number; y: number; at: number };
+
+  launchClock: number;
+  launched: number;
+  flyers: {
+    id: number;
+    suit: Suit;
+    rank: number;
+    x: number;
+    y: number;
+    vx: number;
+    vy: number;
+  }[];
+  cascadeDone: boolean;
+  trailStamps: number;
+
+  simTime: number;
+}
+
+/** A control's hit region in logical units. */
+export interface MenuItemRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+type S = DeepReadonly<CascadeState>;
 
 /**
- * The table background, a CSS color string. `src/main.ts` hands it to the engine
- * as the color the canvas is cleared to each frame, so the letterbox bars around
- * the table match the table itself. This placeholder is replaced by the build with
- * the color its table uses.
+ * The debug and automation surface. A pose takes the current state and returns
+ * the next; a reading takes the state and returns what it read; `move` and
+ * `autoMove` return the next state beside the rules' verdict.
  */
-export const BACKGROUND = "#000";
+export interface CascadeDebugApi {
+  readonly version: number;
 
-const NOT_IMPLEMENTED = "Cascade: src/game.ts is not implemented yet";
+  reset(state: S): CascadeState;
+  snapshot(state: S): CascadeSnapshot;
+  reconcile(state: S): CascadeState;
+  menuItemRect(state: S, index: number): MenuItemRect | null;
+
+  setScreen(state: S, screen: Screen): CascadeState;
+  setMenuIndex(state: S, index: number): CascadeState;
+  setTitleIndex(state: S, index: number): CascadeState;
+
+  addCard(
+    state: S,
+    pile: PileKind,
+    index: number,
+    suit: Suit,
+    rank: number,
+    faceUp: boolean,
+  ): CascadeState;
+  removeCard(state: S, id: number): CascadeState;
+  setCardFaceUp(state: S, id: number, faceUp: boolean): CascadeState;
+  clearPile(state: S, pile: PileKind, index: number): CascadeState;
+  clearTable(state: S): CascadeState;
+
+  addWasteSet(state: S, count: number): CascadeState;
+  clearWasteSets(state: S): CascadeState;
+
+  deal(state: S): CascadeState;
+  turnStock(state: S): CascadeState;
+  move(
+    state: S,
+    fromPile: PileKind,
+    fromIndex: number,
+    fromRow: number,
+    toPile: PileKind,
+    toIndex: number,
+  ): [CascadeState, boolean];
+  autoMove(state: S, pile: PileKind, index: number): [CascadeState, boolean];
+
+  pointerDown(state: S, x: number, y: number): CascadeState;
+  pointerMove(state: S, x: number, y: number): CascadeState;
+  pointerUp(state: S, x: number, y: number): CascadeState;
+
+  setAutoFlip(state: S, enabled: boolean): CascadeState;
+  setWinDetect(state: S, enabled: boolean): CascadeState;
+  setLaunching(state: S, enabled: boolean): CascadeState;
+  setTrailPainting(state: S, enabled: boolean): CascadeState;
+
+  addFlyer(
+    state: S,
+    suit: Suit,
+    rank: number,
+    x: number,
+    y: number,
+    vx: number,
+    vy: number,
+  ): CascadeState;
+  setFlyerPosition(state: S, id: number, x: number, y: number): CascadeState;
+  setFlyerVelocity(state: S, id: number, vx: number, vy: number): CascadeState;
+  removeFlyer(state: S, id: number): CascadeState;
+  clearFlyers(state: S): CascadeState;
+  setLaunchClock(state: S, seconds: number): CascadeState;
+  clearTrail(state: S): CascadeState;
+  drawLaunchVx(state: S): number;
+}
+
+// ---- The game --------------------------------------------------------------
 
 /**
- * The game this build's engine drives.
- *
- * Implement all three functions. Nothing else in the project needs changing for
- * the game to run: `src/main.ts` already binds this object to the engine.
+ * The table background, a CSS color string: the felt's base color, which the
+ * engine clears the canvas to so the letterbox bars match the table.
  */
+export const BACKGROUND = "#0d3a32";
+
+/** Folds one step into a running frame: its state, and its cues collected. */
+function absorb(cues: Set<CueName>, step: Step): GameState {
+  for (const cue of step.cues) cues.add(cue);
+  return step.state;
+}
+
+/** Reads the four menu actions' edges, consuming every one of them. */
+function readMenuKeys(api: UpdateApi) {
+  const up = api.input.pressed(MENU_UP);
+  const down = api.input.pressed(MENU_DOWN);
+  const confirm = api.input.pressed(MENU_CONFIRM);
+  const back = api.input.pressed(MENU_BACK);
+  return { up, down, confirm, back };
+}
+
+/** The game this build's engine drives. */
 export const game: Game<CascadeState, CascadeDebugApi> = {
-  /**
-   * Runs once, before any frame.
-   *
-   * Define the ten CUES, register the diagnostic sources
-   * specs/instrumentation.md lists — each is handed the state current at the
-   * read, so none closes over the state built here — and build the complete
-   * initial state: the title screen, thirteen empty piles, and every other field
-   * of CascadeState set. Return it beside the debug surface.
-   */
-  initialize(_api: InitApi<CascadeState>): [CascadeState, CascadeDebugApi] {
-    throw new Error(NOT_IMPLEMENTED);
+  async initialize(
+    api: InitApi<CascadeState>,
+  ): Promise<[CascadeState, CascadeDebugApi]> {
+    for (const [action, keys] of Object.entries(MENU_BINDINGS)) {
+      api.input.register(action, { keys: [...keys] });
+    }
+    for (const [cue, spec] of Object.entries(CUE_SPECS)) {
+      api.audio.define(cue, spec);
+    }
+    registerDiagnostics(api);
+    await prepareSprites(api.viewport().scale);
+    const state = initialState(createPaintLayer());
+    return [state, createDebugApi()];
   },
 
-  /**
-   * Runs once per frame, before `render`: the next state, from the current one.
-   *
-   * `dt` is the real elapsed SECONDS of this frame. Every rate in
-   * `src/constants.ts` is per second and is multiplied by it, so the same
-   * interval of game time reaches the same state however it was divided into
-   * frames. Answer every pointer sample the frame delivered, in the order it
-   * arrived; advance the victory cascade; play cues; and mirror the engine's mute
-   * bit into the returned state's `muted`. The value returned is what `render`
-   * draws and what the next `update` receives; `state` itself is read-only and
-   * stays as it was.
-   */
   update(
-    _state: DeepReadonly<CascadeState>,
-    _api: UpdateApi,
-    _dt: number,
+    state: DeepReadonly<CascadeState>,
+    api: UpdateApi,
+    dt: number,
   ): CascadeState {
-    throw new Error(NOT_IMPLEMENTED);
+    const cues = new Set<CueName>();
+    let next: GameState = {
+      ...(state as View),
+      simTime: state.simTime + dt,
+    };
+
+    for (const sample of api.input.pointerSamples()) {
+      if (!sample.primary) continue;
+      if (sample.type === "down") {
+        next = absorb(cues, pointerDown(next, sample.x, sample.y));
+      } else if (sample.type === "move") {
+        next = absorb(cues, pointerMove(next, sample.x, sample.y));
+      } else {
+        next = absorb(cues, pointerUp(next, sample.x, sample.y));
+      }
+    }
+
+    const keys = readMenuKeys(api);
+    next = absorb(cues, applyMenuKeys(next, keys));
+    next = absorb(cues, stepCascade(next, dt));
+
+    // `muted` carries the bit the player last asked for; the runtime owns the
+    // bit itself, so the request is handed over and the runtime's answer kept.
+    if (next.muted !== api.audio.muted()) api.audio.setMuted(next.muted);
+    next = { ...next, muted: api.audio.muted() };
+
+    for (const cue of cues) api.audio.play(cue);
+    return next;
   },
 
-  /**
-   * Runs once per frame, after `update`, with the state `update` returned.
-   *
-   * `api.ctx` arrives cleared and already carrying the logical transform, so draw
-   * in 1280x720 coordinates and never read the canvas element's size. The state
-   * arrives read-only, so the type is what guarantees that rendering changes
-   * nothing.
-   */
-  render(_state: DeepReadonly<CascadeState>, _api: RenderApi): void {
-    throw new Error(NOT_IMPLEMENTED);
+  render(state: DeepReadonly<CascadeState>, api: RenderApi): void {
+    renderState(api.ctx, state as View);
   },
 };
